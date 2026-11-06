@@ -8,7 +8,7 @@ Griffin Kernel Manager lets you discover, install, remove, hold, and clean up ke
 
 Distributed as a portable **AppImage**.
 
-Check [Releases](Releases)
+Check [Releases](https://github.com/bobbycomet/GKM/releases)
 
 ## Why it exists
 
