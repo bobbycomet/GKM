@@ -1,0 +1,5 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Bobby Comet
+# Launcher for Griffin Kernel Manager.
+exec /usr/bin/python3 /usr/lib/gkm/gkm.py "$@"

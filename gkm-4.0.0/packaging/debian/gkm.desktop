@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Griffin Kernel Manager
+GenericName=Kernel Manager
+Comment=Install, hold and remove Linux kernels (Debian, Ubuntu, Arch, Fedora, openSUSE)
+Exec=gkm
+Icon=gkm
+Terminal=false
+Categories=System;Settings;PackageManager;
+Keywords=kernel;xanmod;liquorix;cachyos;mainline;dkms;
+StartupNotify=true
+StartupWMClass=com.griffin.kernel.manager

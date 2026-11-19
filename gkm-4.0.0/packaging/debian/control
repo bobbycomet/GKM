@@ -1,0 +1,26 @@
+Package: gkm
+Version: 4.0.0
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Bobby Comet <griffin.linux@gmail.com>
+Depends: python3 (>= 3.10), python3-pyqt6, pkexec | policykit-1, gnupg, curl
+Recommends: dkms, software-properties-common
+Conflicts: xkm, xkm-multi-kernel-manager
+Replaces: xkm, xkm-multi-kernel-manager
+Provides: xkm, xkm-multi-kernel-manager
+Homepage: https://github.com/bobbycomet/XKM-Multi-Kernel-Manager
+Description: Griffin Kernel Manager for Linux (APT, pacman, dnf, zypper)
+ GKM is a PyQt6 GUI for installing, removing, holding/unholding and
+ tracking Linux kernels. It detects the distribution (and the base distro
+ of derivatives) and the hardware, and manages the kernels that fit:
+ mainline, XanMod and Liquorix on Debian/Ubuntu systems (other families
+ are supported by the AppImage build).
+ .
+ It handles repository setup, package holds, a bootloader refresh safety
+ net after install/remove, and DKMS rebuilds for newly installed kernels,
+ with a reboot prompt once everything is ready.
+ .
+ All privileged operations are performed by a small dedicated helper
+ script authorised via a scoped polkit policy, rather than granting the
+ whole application root privileges.

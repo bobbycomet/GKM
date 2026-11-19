@@ -1,0 +1,22 @@
+{
+  "_comment": "Known kernels for the Arch family. Discovery is generic (any package with a -headers sibling); this file adds descriptions, a provider tab, the repository a kernel normally comes from, and hardware requirements. Add your own in ~/.config/griffin-kernel-manager/kernels.json (same format).",
+  "kernels": [
+    {"name": "linux",           "provider": "arch", "description": "The mainline kernel, stable branch (Arch's default)."},
+    {"name": "linux-lts",       "provider": "arch", "description": "Long-term-support kernel: slower-moving and conservative."},
+    {"name": "linux-zen",       "provider": "arch", "description": "Zen kernel: desktop and low-latency tuning."},
+    {"name": "linux-hardened",  "provider": "arch", "description": "Security-hardened kernel."},
+    {"name": "linux-rt",        "provider": "arch", "description": "PREEMPT_RT real-time kernel."},
+    {"name": "linux-rt-lts",    "provider": "arch", "description": "PREEMPT_RT real-time kernel on a long-term-support base."},
+
+    {"name": "linux-xanmod",     "provider": "xanmod",   "repository": "chaotic-aur", "description": "XanMod: desktop- and gaming-tuned kernel (main branch)."},
+    {"name": "linux-xanmod-lts", "provider": "xanmod",   "repository": "chaotic-aur", "description": "XanMod on a long-term-support branch."},
+    {"name": "linux-cachyos",    "provider": "cachyos",  "repository": "chaotic-aur", "description": "CachyOS kernel: BORE/EEVDF scheduler plus performance patches."},
+    {"name": "linux-clear",      "provider": "clear",    "repository": "chaotic-aur", "description": "Kernel with Clear Linux's patch set."},
+    {"name": "linux-lqx",        "provider": "liquorix", "repository": "chaotic-aur", "description": "Liquorix: Zen-based low-latency desktop kernel."},
+    {"name": "linux-tkg-pds",    "provider": "tkg",      "repository": "chaotic-aur", "description": "linux-tkg: customisable kernel built with the PDS scheduler."},
+    {"name": "linux-lts-tkg-bmq","provider": "tkg",      "repository": "chaotic-aur", "description": "linux-tkg on an LTS base, built with the BMQ scheduler."},
+    {"name": "linux-ck",         "provider": "other",    "repository": "repo-ck",     "description": "Con Kolivas' patchset (hrtimer, BFQ and scheduler work). Comes from the separate repo-ck repository."},
+    {"name": "linux-amd",        "provider": "other",    "repository": "chaotic-aur", "description": "Kernel built for AMD Zen 4 (znver4) CPUs.", "requires": {"zen4": true}},
+    {"name": "linux-nitrous",    "provider": "other",    "repository": "chaotic-aur", "description": "Clang-built kernel optimised for Skylake and newer.", "requires": {"psabi": "v3"}}
+  ]
+}

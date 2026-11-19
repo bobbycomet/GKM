@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Bobby Comet
+# GKM AppImage entry point.
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+export GKM_APPIMAGE=1
+
+# Bundled xcb helper libraries (Qt 6.5+ needs libxcb-cursor and friends, which many
+# distros do not install). Everything else Qt needs comes from the wheel or the host.
+# The original value is kept so host tools started by GKM get a clean environment.
+export GKM_ORIG_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib-gkm${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+export PYTHONNOUSERSITE=1          # never pick up the user's site-packages
+export PYTHONDONTWRITEBYTECODE=1   # the image is read-only; .pyc files are pre-built
+export GKM_RESOURCE_DIR="$APPDIR/usr/python/lib/python3.12/site-packages/gkm/resources"
+
+exec "$APPDIR/usr/python/bin/python3" -m gkm "$@"

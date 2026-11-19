@@ -1,0 +1,535 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Bobby Comet
+#
+# gkm-helper — privileged operations for the Griffin Kernel Manager.
+#
+# Invoked exclusively as:
+#     pkexec /usr/lib/gkm/gkm-helper <subcommand> [args...]
+#
+# It is NOT a general-purpose root shell. Only the fixed set of subcommands in
+# the dispatcher at the bottom is accepted, every package spec / kernel version
+# is re-validated here (on top of the GUI-side validation) before it reaches a
+# package manager, and no argument is ever passed through a shell or eval.
+# Do not add subcommands that accept arbitrary strings, paths or URLs.
+#
+# One helper serves every supported family; the package manager is detected
+# from what is installed: apt-get (Debian/Ubuntu), pacman (Arch family),
+# dnf (Fedora/RHEL family), zypper (openSUSE).
+
+set -euo pipefail
+
+export LC_ALL=C LANG=C
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+export NEEDRESTART_MODE=l
+
+readonly HELPER_VERSION="4.0.0"
+readonly HELPER_PROTOCOL=4
+
+# NAME: package names across apt/pacman/rpm (letters, digits, + . _ @ -)
+# VER:  versions (adds : ~ ^ for epochs and pre-releases). Both must start with
+#       an alphanumeric so an argument can never be parsed as an option.
+readonly NAME_RE='^[A-Za-z0-9][A-Za-z0-9+._@-]*$'
+readonly VER_RE='^[A-Za-z0-9][A-Za-z0-9+._:~^-]*$'
+readonly KVER_RE='^[A-Za-z0-9][A-Za-z0-9.+_~-]*$'
+
+readonly PACMAN_CONF=/etc/pacman.conf
+readonly HOLD_BEGIN='# BEGIN GKM HOLD (managed by GKM - do not edit)'
+# Blocks written by XKM 3.1 used these markers; they are still read and are migrated on the next write.
+readonly LEGACY_HOLD_BEGIN='# BEGIN XKM HOLD (managed by XKM - do not edit)'
+readonly LEGACY_HOLD_END='# END XKM HOLD'
+readonly HOLD_END='# END GKM HOLD'
+
+die() {
+    echo "gkm-helper: $*" >&2
+    exit 1
+}
+
+PM=""
+detect_pm() {
+    if   command -v apt-get >/dev/null 2>&1; then PM=apt
+    elif command -v pacman  >/dev/null 2>&1; then PM=pacman
+    elif command -v zypper  >/dev/null 2>&1; then PM=zypper
+    elif command -v dnf     >/dev/null 2>&1; then PM=dnf
+    else die "no supported package manager found (apt-get, pacman, dnf, zypper)"; fi
+}
+
+require_pm() {
+    detect_pm
+    [ "$PM" = "$1" ] || die "this subcommand is only available on $1-based systems (detected: $PM)"
+}
+
+is_dnf5() {
+    local p
+    p=$(readlink -f "$(command -v dnf)" 2>/dev/null || true)
+    [[ "$p" == *dnf5* ]]
+}
+
+# ── Argument validation ──────────────────────────────────────────────────────
+SPEC_NAMES=()
+SPEC_VERS=()
+RENDERED=()
+
+parse_specs() {
+    [ $# -ge 1 ] || die "no packages given"
+    SPEC_NAMES=(); SPEC_VERS=()
+    local s n v
+    for s in "$@"; do
+        n="${s%%=*}"; v=""
+        if [[ "$s" == *=* ]]; then v="${s#*=}"; fi
+        [[ "$n" =~ $NAME_RE ]] || die "invalid package name rejected: $n"
+        if [ -n "$v" ]; then
+            [[ "$v" =~ $VER_RE ]] || die "invalid package version rejected: $v"
+        fi
+        SPEC_NAMES+=("$n"); SPEC_VERS+=("$v")
+    done
+}
+
+# Turn NAME / NAME=VERSION into what the detected package manager understands.
+render_specs() {
+    RENDERED=()
+    local i n v
+    for i in "${!SPEC_NAMES[@]}"; do
+        n="${SPEC_NAMES[$i]}"; v="${SPEC_VERS[$i]}"
+        if [ -z "$v" ]; then RENDERED+=("$n"); continue; fi
+        case "$PM" in
+            apt)    RENDERED+=("$n=$v") ;;
+            dnf)    RENDERED+=("$n-$v") ;;
+            zypper) RENDERED+=("$n=$v") ;;
+            pacman) RENDERED+=("$n") ;;       # pacman cannot pin an older build
+        esac
+    done
+}
+
+check_kvers() {
+    [ $# -ge 1 ] || die "no kernel versions given"
+    local k
+    for k in "$@"; do
+        [[ "$k" =~ $KVER_RE ]] || die "invalid kernel version rejected: $k"
+    done
+}
+
+no_args() { [ "$1" -eq 0 ] || die "$2 takes no arguments"; }
+
+# ── os-release helpers ───────────────────────────────────────────────────────
+OS_ID=""; OS_LIKE=""; OS_CODENAME=""
+load_os_release() {
+    [ -r /etc/os-release ] || die "/etc/os-release not found"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"; OS_LIKE="${ID_LIKE:-}"
+    if [[ " $OS_ID $OS_LIKE " == *" ubuntu "* ]]; then
+        OS_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    else
+        OS_CODENAME="${DEBIAN_CODENAME:-${VERSION_CODENAME:-}}"
+    fi
+}
+is_ubuntu_based() { [[ " $OS_ID $OS_LIKE " == *" ubuntu "* ]]; }
+
+ensure_apt_tools() {
+    local missing=()
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v gpg  >/dev/null 2>&1 || missing+=(gnupg)
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "Installing prerequisites: ${missing[*]}…"
+        apt-get install -y ca-certificates "${missing[@]}"
+    fi
+}
+
+# ── Repositories ─────────────────────────────────────────────────────────────
+add_repo_xanmod() {
+    require_pm apt; load_os_release
+    [[ "$OS_CODENAME" =~ ^[a-z][a-z0-9]*$ ]] || die "could not determine the distribution codename"
+    ensure_apt_tools
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+    chmod 0644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
+    # 3.0.x wrote an older-style source (suite "releases"); replace it.
+    rm -f /etc/apt/sources.list.d/xanmod-kernel.list
+    echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $OS_CODENAME main" \
+        > /etc/apt/sources.list.d/xanmod-release.list
+    exec apt-get update -qq
+}
+
+add_repo_liquorix() {
+    require_pm apt; load_os_release
+    if is_ubuntu_based; then
+        if ! command -v add-apt-repository >/dev/null 2>&1; then
+            echo "add-apt-repository not found — installing software-properties-common…"
+            apt-get install -y software-properties-common
+        fi
+        add-apt-repository -y ppa:damentz/liquorix
+        exec apt-get update -qq
+    fi
+    [[ "$OS_CODENAME" =~ ^[a-z][a-z0-9]*$ ]] || die "could not determine the Debian codename"
+    ensure_apt_tools
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://liquorix.net/liquorix-keyring.gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/liquorix-keyring.gpg
+    chmod 0644 /etc/apt/keyrings/liquorix-keyring.gpg
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/liquorix-keyring.gpg] https://liquorix.net/debian $OS_CODENAME main" \
+        > /etc/apt/sources.list.d/liquorix.list
+    exec apt-get update -qq
+}
+
+add_repo_chaotic_aur() {
+    require_pm pacman
+    if grep -q '^\[chaotic-aur\]' "$PACMAN_CONF"; then
+        echo "chaotic-aur is already configured."
+        exit 0
+    fi
+    pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com
+    pacman-key --lsign-key 3056513887B78AEB
+    pacman -U --noconfirm \
+        'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+        'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'
+    cp -a "$PACMAN_CONF" "$PACMAN_CONF.gkm-bak"
+    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> "$PACMAN_CONF"
+    # A newly added repository needs a forced refresh (-Syy). The full upgrade that Arch expects after
+    # syncing (-Syu) is a separate subcommand, `upgrade-system`, so the GUI can ask first.
+    echo "Chaotic-AUR added. Forcing a database refresh…"
+    pacman -Syy --noconfirm
+    echo "Done. Arch expects a full system upgrade after syncing: run it from GKM, or 'sudo pacman -Syu'."
+}
+
+copr_enable() {
+    local project="$1"
+    require_pm dnf
+    if ! dnf -y copr enable "$project"; then
+        echo "The dnf copr plugin may be missing — installing it and retrying…"
+        dnf -y install 'dnf-command(copr)' || dnf -y install 'dnf5-command(copr)' || dnf -y install dnf-plugins-core
+        dnf -y copr enable "$project"
+    fi
+    echo "Enabled COPR $project."
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; then
+        echo "Note: SELinux is enforcing. CachyOS/XanMod kernels need: setsebool -P domain_kernel_load_modules on"
+    fi
+}
+
+# ── pacman: hold = IgnorePkg block managed by GKM ────────────────────────────
+pacman_hold_list() {
+    awk -v b="$HOLD_BEGIN" -v e="$HOLD_END" -v lb="$LEGACY_HOLD_BEGIN" -v le="$LEGACY_HOLD_END" '
+        $0 == b || $0 == lb { f = 1; next }
+        $0 == e || $0 == le { f = 0; next }
+        f && /^IgnorePkg[ \t]*=/ { sub(/^IgnorePkg[ \t]*=[ \t]*/, ""); print }
+    ' "$PACMAN_CONF" | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+pacman_hold_write() {   # args: the complete list of held names (may be empty)
+    local list="$*" tmp
+    grep -q '^\[options\]' "$PACMAN_CONF" || die "no [options] section in $PACMAN_CONF"
+    tmp=$(mktemp)
+    awk -v list="$list" -v b="$HOLD_BEGIN" -v e="$HOLD_END" -v lb="$LEGACY_HOLD_BEGIN" -v le="$LEGACY_HOLD_END" '
+        $0 == b || $0 == lb { skip = 1; next }
+        $0 == e || $0 == le { skip = 0; next }
+        skip { next }
+        { print }
+        /^\[options\]/ && !done {
+            if (list != "") { print b; print "IgnorePkg = " list; print e }
+            done = 1
+        }
+    ' "$PACMAN_CONF" > "$tmp"
+    grep -q '^\[options\]' "$tmp" || { rm -f "$tmp"; die "refusing to write a damaged $PACMAN_CONF"; }
+    cp -a "$PACMAN_CONF" "$PACMAN_CONF.gkm-bak"
+    cat "$tmp" > "$PACMAN_CONF"
+    rm -f "$tmp"
+}
+
+pacman_hold() {
+    local cur=() n
+    mapfile -t cur < <(pacman_hold_list)
+    for n in "$@"; do cur+=("$n"); done
+    mapfile -t cur < <(printf '%s\n' "${cur[@]}" | sort -u)
+    pacman_hold_write "${cur[@]}"
+    echo "Held (IgnorePkg): $*"
+}
+
+pacman_unhold() {
+    local cur=() keep=() n x drop
+    mapfile -t cur < <(pacman_hold_list)
+    for x in "${cur[@]}"; do
+        drop=0
+        for n in "$@"; do [ "$x" = "$n" ] && drop=1; done
+        [ "$drop" -eq 1 ] || keep+=("$x")
+    done
+    pacman_hold_write "${keep[@]}"
+    echo "Released: $*"
+}
+
+# ── dnf: hold = versionlock ──────────────────────────────────────────────────
+ensure_versionlock() {
+    dnf versionlock list >/dev/null 2>&1 && return 0
+    echo "dnf versionlock is not available — installing the plugin…"
+    dnf -y install 'dnf-command(versionlock)' || dnf -y install 'dnf5-command(versionlock)' \
+        || dnf -y install python3-dnf-plugin-versionlock || true
+    dnf versionlock list >/dev/null 2>&1 || die "could not enable the dnf versionlock plugin"
+}
+
+dnf_hold() {
+    ensure_versionlock
+    dnf versionlock add "$@"
+}
+
+dnf_unhold() {
+    ensure_versionlock
+    if is_dnf5; then
+        dnf versionlock delete "$@"
+        return
+    fi
+    # dnf4: edit the lock list directly — exact and independent of plugin globbing rules.
+    local f=/etc/dnf/plugins/versionlock.list n
+    [ -f "$f" ] || { echo "No versionlock entries."; return 0; }
+    for n in "$@"; do
+        sed -i -E "\\|^${n//./\\.}-[0-9]+:|d" "$f"
+    done
+    echo "Released: $*"
+}
+
+# ── Restore an older package version (pacman) ────────────────────────────────
+# Source 1: the local pacman cache (offline, fast). Source 2: the Arch Linux Archive, from a URL this
+# function builds itself out of the validated name and version: the GUI never supplies a URL. pacman
+# downloads the detached .sig and verifies it according to pacman.conf. All packages go into ONE
+# `pacman -U` transaction so a kernel and its headers stay consistent (pacman does not resolve
+# dependencies for -U targets).
+restore_version() {
+    require_pm pacman
+    parse_specs "$@"
+    local i n v arch cachedir line f ext found all_cached=1
+    for i in "${!SPEC_NAMES[@]}"; do
+        [ -n "${SPEC_VERS[$i]}" ] || die "restore-version needs NAME=VERSION (got ${SPEC_NAMES[$i]})"
+        [[ "${SPEC_VERS[$i]}" != *:* ]] || die "versions with an epoch are not supported by restore-version"
+        [[ "${SPEC_VERS[$i]}" =~ ^[0-9] ]] || die "invalid package version rejected: ${SPEC_VERS[$i]}"
+    done
+    arch=$(uname -m)
+    [ "$arch" = x86_64 ] || die "the Arch Linux Archive only carries x86_64 packages (this is $arch)"
+    cachedir=/var/cache/pacman/pkg
+    if line=$(pacman-conf CacheDir 2>/dev/null | head -n1) && [ -n "$line" ]; then cachedir="${line%/}"; fi
+
+    local local_targets=()
+    for i in "${!SPEC_NAMES[@]}"; do
+        n="${SPEC_NAMES[$i]}"; v="${SPEC_VERS[$i]}"; found=""
+        for ext in zst xz; do
+            f="$cachedir/$n-$v-$arch.pkg.tar.$ext"
+            if [ -f "$f" ]; then found="$f"; break; fi
+        done
+        if [ -n "$found" ]; then local_targets+=("$found"); else all_cached=0; fi
+    done
+    if [ "$all_cached" -eq 1 ]; then
+        echo "Restoring from the local pacman cache…"
+        if pacman -U --noconfirm "${local_targets[@]}"; then return 0; fi
+        echo "Installing from the cache failed; trying the Arch Linux Archive…"
+    fi
+    echo "Restoring from the Arch Linux Archive (https://archive.archlinux.org)…"
+    for ext in zst xz; do
+        local urls=()
+        for i in "${!SPEC_NAMES[@]}"; do
+            n="${SPEC_NAMES[$i]}"; v="${SPEC_VERS[$i]}"
+            urls+=("https://archive.archlinux.org/packages/${n:0:1}/$n/$n-$v-$arch.pkg.tar.$ext")
+        done
+        if pacman -U --noconfirm "${urls[@]}"; then return 0; fi
+    done
+    die "could not restore the requested version (not in the cache or the Arch Linux Archive, or pacman refused it)"
+}
+
+# ── Bootloader ───────────────────────────────────────────────────────────────
+# Kernel packages normally refresh the bootloader themselves; this is a safety
+# net. It only acts where the setup is unambiguous and otherwise says so.
+do_update_bootloader() {
+    detect_pm
+    if command -v update-grub >/dev/null 2>&1; then
+        exec update-grub
+    elif [ "$PM" = zypper ] && command -v update-bootloader >/dev/null 2>&1; then
+        exec update-bootloader --refresh
+    fi
+    local ran=0 failed=0
+    if [ "$PM" = pacman ]; then
+        # systemd-boot on CachyOS/Manjaro-style systems: sdboot-manage generates entries for installed kernels
+        # (it does not overwrite entries that already exist unless the user configured it to).
+        if command -v sdboot-manage >/dev/null 2>&1; then
+            echo "Generating systemd-boot entries (sdboot-manage gen)…"
+            if sdboot-manage gen; then ran=1; else failed=1; echo "sdboot-manage reported a problem."; fi
+        fi
+        if command -v grub-mkconfig >/dev/null 2>&1 && [ -f /boot/grub/grub.cfg ]; then
+            echo "Regenerating the GRUB configuration…"
+            if grub-mkconfig -o /boot/grub/grub.cfg; then ran=1; else failed=1; echo "grub-mkconfig reported a problem."; fi
+        fi
+    fi
+    [ "$failed" -eq 0 ] || exit 1
+    [ "$ran" -eq 0 ] || exit 0
+    echo "No bootloader refresh was needed or possible: entries are managed by the kernel packages"
+    echo "(BLS/kernel-install, Limine and similar)."
+    if [ "$PM" = pacman ] && command -v bootctl >/dev/null 2>&1 && bootctl is-installed >/dev/null 2>&1; then
+        echo "systemd-boot is installed but no entry generator (sdboot-manage) was found. GKM cannot create"
+        echo "systemd-boot entries itself: if a new kernel is missing from the boot menu, add an entry for it"
+        echo "(see the GKM wiki, Backends reference > Bootloader) or install your distribution's entry tool."
+    fi
+    exit 0
+}
+
+# ── DKMS ─────────────────────────────────────────────────────────────────────
+do_dkms_autoinstall() {
+    check_kvers "$@"
+    if ! command -v dkms >/dev/null 2>&1; then
+        echo "dkms is not installed — nothing to rebuild."
+        exit 0
+    fi
+    local FAILED_KERNELS=() DKMS_REPORT="" kver MODULES line mod state
+    for kver in "$@"; do
+        echo ""
+        echo "━━━ DKMS autoinstall for: $kver ━━━"
+
+        MODULES=$(dkms status 2>/dev/null | awk -F',' '{print $1}' | sort -u || true)
+        if [ -z "$MODULES" ]; then
+            echo "  ✓ No DKMS modules registered — nothing to do for $kver"
+            continue
+        fi
+        if [ ! -e "/lib/modules/$kver/build" ] && [ ! -e "/usr/lib/modules/$kver/build" ]; then
+            echo "  ✗ Kernel headers for $kver are not installed — DKMS cannot build modules for it."
+            echo "    Install the matching headers/devel package, then run Rebuild DKMS."
+            FAILED_KERNELS+=("$kver")
+            continue
+        fi
+
+        if dkms autoinstall -k "$kver" 2>&1; then
+            echo "  ✓ dkms autoinstall succeeded for $kver"
+        else
+            echo "  ✗ dkms autoinstall reported errors for $kver"
+            FAILED_KERNELS+=("$kver")
+        fi
+
+        echo ""
+        echo "  Verifying DKMS module status for $kver:"
+        while IFS= read -r line; do
+            mod=$(echo "$line" | awk -F',' '{print $1}')
+            state=$(echo "$line" | grep -oP '(installed|built|not installed|disabled|error)' | head -1 || true)
+            if [[ "$line" == *"$kver"* ]]; then
+                if [[ "$state" == "installed" || "$state" == "built" ]]; then
+                    echo "    ✓  $mod — $state"
+                else
+                    echo "    ✗  $mod — ${state:-unknown} (may need attention)"
+                    DKMS_REPORT+="WARN: $mod on $kver is '${state:-unknown}'\n"
+                fi
+            fi
+        done < <(dkms status 2>/dev/null || true)
+    done
+
+    if [ -n "$DKMS_REPORT" ]; then
+        echo ""
+        echo "━━━ DKMS Warning Summary ━━━"
+        echo -e "$DKMS_REPORT"
+    fi
+    if [ ${#FAILED_KERNELS[@]} -gt 0 ]; then
+        echo ""
+        echo "━━━ DKMS ERRORS ━━━"
+        echo "The following kernels had DKMS failures:"
+        for kver in "${FAILED_KERNELS[@]}"; do echo "  ✗ $kver"; done
+        echo "You may need to run manually: sudo dkms autoinstall -k <version>"
+        exit 1
+    fi
+    echo ""
+    echo "✓ All DKMS modules processed successfully."
+    exit 0
+}
+
+# ── Dispatcher ───────────────────────────────────────────────────────────────
+[ $# -ge 1 ] || die "no subcommand given"
+cmd="$1"
+shift
+
+case "$cmd" in
+
+  version)
+    echo "gkm-helper $HELPER_VERSION protocol $HELPER_PROTOCOL"
+    ;;
+
+  update-sources)
+    no_args $# update-sources; detect_pm
+    case "$PM" in
+        apt)    exec apt-get update -qq ;;
+        pacman) exec pacman -Sy --noconfirm ;;
+        dnf)    exec dnf -y --refresh makecache ;;
+        zypper) exec zypper --non-interactive refresh ;;
+    esac
+    ;;
+
+  add-repo-xanmod)         no_args $# "$cmd"; add_repo_xanmod ;;
+  add-repo-liquorix)       no_args $# "$cmd"; add_repo_liquorix ;;
+  add-repo-chaotic-aur)    no_args $# "$cmd"; add_repo_chaotic_aur ;;
+  add-repo-copr-cachyos)   no_args $# "$cmd"; copr_enable bieszczaders/kernel-cachyos ;;
+  add-repo-copr-xanmod)    no_args $# "$cmd"; copr_enable rmnscnce/kernel-xanmod ;;
+
+  install)
+    detect_pm; parse_specs "$@"; render_specs
+    case "$PM" in
+        apt)    exec apt-get install -y "${RENDERED[@]}" ;;
+        pacman) exec pacman -S --needed --noconfirm "${RENDERED[@]}" ;;
+        dnf)    exec dnf -y install "${RENDERED[@]}" ;;
+        zypper) exec zypper --non-interactive install "${RENDERED[@]}" ;;
+    esac
+    ;;
+
+  remove)
+    purge=0
+    if [ "${1:-}" = "--purge" ]; then purge=1; shift; fi
+    detect_pm; parse_specs "$@"; render_specs
+    case "$PM" in
+        apt)
+            if [ "$purge" -eq 1 ]; then exec apt-get remove -y --purge "${RENDERED[@]}"; fi
+            exec apt-get remove -y "${RENDERED[@]}" ;;
+        pacman)
+            if [ "$purge" -eq 1 ]; then exec pacman -Rn --noconfirm "${RENDERED[@]}"; fi
+            exec pacman -R --noconfirm "${RENDERED[@]}" ;;
+        dnf)    exec dnf -y remove "${RENDERED[@]}" ;;
+        zypper) exec zypper --non-interactive remove "${RENDERED[@]}" ;;
+    esac
+    ;;
+
+  hold)
+    detect_pm; parse_specs "$@"
+    case "$PM" in
+        apt)    exec apt-mark hold "${SPEC_NAMES[@]}" ;;
+        pacman) pacman_hold "${SPEC_NAMES[@]}" ;;
+        dnf)    dnf_hold "${SPEC_NAMES[@]}" ;;
+        zypper) exec zypper --non-interactive addlock "${SPEC_NAMES[@]}" ;;
+    esac
+    ;;
+
+  unhold)
+    detect_pm; parse_specs "$@"
+    case "$PM" in
+        apt)    exec apt-mark unhold "${SPEC_NAMES[@]}" ;;
+        pacman) pacman_unhold "${SPEC_NAMES[@]}" ;;
+        dnf)    dnf_unhold "${SPEC_NAMES[@]}" ;;
+        zypper) exec zypper --non-interactive removelock "${SPEC_NAMES[@]}" ;;
+    esac
+    ;;
+
+  restore-version)
+    restore_version "$@"
+    ;;
+
+  upgrade-system)
+    # Full system upgrade (pacman -Syu). Only offered after adding a repository on Arch, where syncing
+    # databases without upgrading is the classic partial-upgrade trap. The GUI always asks first.
+    no_args $# upgrade-system; require_pm pacman
+    exec pacman -Syu --noconfirm
+    ;;
+
+  update-bootloader|update-grub)
+    no_args $# "$cmd"; do_update_bootloader
+    ;;
+
+  dkms-autoinstall)
+    do_dkms_autoinstall "$@"
+    ;;
+
+  reboot)
+    no_args $# reboot
+    if command -v systemctl >/dev/null 2>&1; then exec systemctl reboot; fi
+    exec reboot
+    ;;
+
+  *)
+    die "unknown subcommand: $cmd"
+    ;;
+esac
